@@ -1,0 +1,27 @@
+# ============================================================
+# 基于已有镜像修复 shebang + entrypoint + 补依赖
+# 用法: docker build -f Dockerfile.fix -t longcat-video:latest .
+# ============================================================
+
+FROM longcat-video:latest
+
+# 1. 清理 update-alternatives 产生的失效符号链接
+RUN rm -f /usr/bin/python /usr/bin/python3 \
+    /etc/alternatives/python /etc/alternatives/python3 \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python3
+
+# 2. 修复 /usr/local/bin 下所有 console script 的 shebang
+#    将首行的 #!<any>python... 统一替换为 #!/usr/bin/python3
+RUN find /usr/local/bin -type f -executable -print0 \
+    | xargs -0 grep -Zl '^#!.*python' \
+    | xargs -0 sed -i '1s|^#!.*python.*$|#!/usr/bin/python3|'
+
+# 3. 补充缺失的间接依赖
+RUN pip install accelerate
+
+# 4. 修复 ENTRYPOINT：改为 CMD，避免 bash 误解释所有命令
+#    ENTRYPOINT ["bash"] 会导致 docker run image xxx 变成 bash xxx
+#    bash 把 xxx 当脚本解释 → cannot execute binary file
+ENTRYPOINT []
+CMD ["bash"]

@@ -1,0 +1,132 @@
+# ============================================================
+# LongCat-Video-Avatar-1.5 Docker Compose
+# 仅运行 Avatar-1.5 推理，需要以下权重目录：
+#   weights/LongCat-Video/          (基座模型: tokenizer, text_encoder, vae)
+#   weights/LongCat-Video-Avatar-1.5/ (Avatar-1.5: scheduler, dit, lora, whisper, vocal_separator)
+# ============================================================
+#
+# Usage:
+#   # Avatar 单人 AI2V (音频+图片→视频, 蒸馏+INT8, 4卡)
+#   docker compose run avatar-single
+#
+#   # Avatar 单人 AT2V (音频+文本→视频, 蒸馏+INT8, 4卡)
+#   docker compose run avatar-single-at2v
+#
+#   # Avatar 单人 长视频 (5段续写)
+#   docker compose run avatar-single-long
+#
+#   # Avatar 多人 AI2V
+#   docker compose run avatar-multi
+#
+#   # 交互式容器 (进容器后手动 torchrun)
+#   docker compose run --rm shell
+#
+#   # Streamlit Web UI
+#   docker compose up avatar-streamlit
+#
+# ============================================================
+
+services:
+  avatar-base: &base
+    image: longcat-video:latest
+    volumes:
+      # 挂载项目代码目录，新增/修改的 Python 文件无需重新构建镜像
+      - .:/app
+      # 权重和输出用更具体的路径覆盖上方的子目录挂载
+      - ${WEIGHTS_DIR:-./weights}:/app/weights:ro
+      - ${OUTPUT_DIR:-./outputs}:/app/outputs
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${GPU_IDS:-all}
+      - RANK=0
+      - LOCAL_RANK=0
+      - WORLD_SIZE=4
+      - MASTER_ADDR=127.0.0.1
+      - MASTER_PORT=29500
+    shm_size: "512g"
+    mem_limit: 512g
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ---- Avatar 单人 AI2V (音频+图片→视频) ----
+  avatar-single:
+    <<: *base
+    command: >
+      torchrun --nproc_per_node=4 run_demo_avatar_single_audio_to_video_timed.py
+      --context_parallel_size=4
+      --checkpoint_dir=/app/weights/LongCat-Video-Avatar-1.5
+      --stage_1=ai2v
+      --input_json=/app/assets/avatar/single_example_1.json
+      --use_distill
+      --model_type=avatar-v1.5
+      --use_int8
+
+  # ---- Avatar 单人 AT2V (音频+文本→视频) ----
+  avatar-single-at2v:
+    <<: *base
+    command: >
+      torchrun --nproc_per_node=4 run_demo_avatar_single_audio_to_video_timed.py
+      --context_parallel_size=4
+      --checkpoint_dir=/app/weights/LongCat-Video-Avatar-1.5
+      --stage_1=at2v
+      --input_json=/app/assets/avatar/single_example_1.json
+      --use_distill
+      --model_type=avatar-v1.5
+      --use_int8
+
+  # ---- Avatar 单人 长视频 (5段续写) ----
+  avatar-single-long:
+    <<: *base
+    command: >
+      torchrun --nproc_per_node=4 run_demo_avatar_single_audio_to_video_timed.py
+      --context_parallel_size=4
+      --checkpoint_dir=/app/weights/LongCat-Video-Avatar-1.5
+      --stage_1=ai2v
+      --input_json=/app/assets/avatar/single_example_1.json
+      --num_segments=5
+      --ref_img_index=10
+      --mask_frame_range=3
+      --use_distill
+      --model_type=avatar-v1.5
+      --use_int8
+
+  # ---- Avatar 多人 AI2V ----
+  avatar-multi:
+    <<: *base
+    command: >
+      torchrun --nproc_per_node=4 run_demo_avatar_multi_audio_to_video_timed.py
+      --context_parallel_size=4
+      --checkpoint_dir=/app/weights/LongCat-Video-Avatar-1.5
+      --input_json=/app/assets/avatar/multi_example_1.json
+      --use_distill
+      --model_type=avatar-v1.5
+      --use_int8
+
+  # ---- Interactive Shell (enter container, run torchrun manually) ----
+  shell:
+    <<: *base
+    stdin_open: true
+    tty: true
+
+  # ---- Avatar Streamlit Web UI (单卡) ----
+  avatar-streamlit:
+    <<: *base
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${GPU_IDS:-0}
+      - RANK=0
+      - LOCAL_RANK=0
+      - WORLD_SIZE=1
+      - MASTER_ADDR=127.0.0.1
+      - MASTER_PORT=29500
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    command: >
+      streamlit run ./run_streamlit_avatar.py
+      --server.fileWatcherType none
+      --server.headless=true
+      --server.address=0.0.0.0
+      --server.port=8501

@@ -1,0 +1,205 @@
+# ============================================================
+# LongCat-Video Docker Compose
+# Mount model weights and launch inference services
+# ============================================================
+#
+# Usage:
+#   # Build the image first
+#   docker compose build
+#
+#   # Text-to-Video (single GPU)
+#   docker compose run t2v
+#
+#   # Text-to-Video (multi GPU)
+#   docker compose run --scale t2v=2 t2v-multi
+#
+#   # Image-to-Video
+#   docker compose run i2v
+#
+#   # Video Continuation
+#   docker compose run vc
+#
+#   # Long Video
+#   docker compose run long-video
+#
+#   # Interactive Video
+#   docker compose run interactive
+#
+#   # Avatar Single Audio (v1.5, distill, INT8)
+#   docker compose run avatar-single
+#
+#   # Avatar Multi Audio
+#   docker compose run avatar-multi
+#
+#   # Streamlit Web UI
+#   docker compose up streamlit
+#
+# ============================================================
+
+services:
+  # ---- Base / shared config (not started directly) ----
+  longcat-base: &base
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: longcat-video:latest
+    volumes:
+      # 挂载项目代码目录，新增/修改的 Python 文件无需重新构建镜像
+      - .:/app
+      # 权重和输出用更具体的路径覆盖上方的子目录挂载
+      - ${WEIGHTS_DIR:-./weights}:/app/weights:ro
+      - ${OUTPUT_DIR:-./outputs}:/app/outputs
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - RANK=0
+      - LOCAL_RANK=0
+      - WORLD_SIZE=1
+      - MASTER_ADDR=127.0.0.1
+      - MASTER_PORT=29500
+    shm_size: "16g"
+    mem_limit: 256g
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ---- Interactive Shell (enter container, run torchrun manually) ----
+  shell:
+    <<: *base
+    stdin_open: true
+    tty: true
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - RANK=0
+      - LOCAL_RANK=0
+      - WORLD_SIZE=4
+      - MASTER_ADDR=127.0.0.1
+      - MASTER_PORT=29500
+
+  # ---- Text-to-Video ----
+  t2v:
+    <<: *base
+    command: >
+      torchrun --nproc_per_node=1 run_demo_text_to_video.py
+      --checkpoint_dir=/app/weights/LongCat-Video
+      --enable_compile
+
+  # ---- Text-to-Video (2 GPU) ----
+  t2v-multi:
+    <<: *base
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - RANK=0
+      - LOCAL_RANK=0
+      - WORLD_SIZE=2
+      - MASTER_ADDR=127.0.0.1
+      - MASTER_PORT=29500
+    command: >
+      torchrun --nproc_per_node=2 run_demo_text_to_video.py
+      --context_parallel_size=2
+      --checkpoint_dir=/app/weights/LongCat-Video
+      --enable_compile
+
+  # ---- Image-to-Video ----
+  i2v:
+    <<: *base
+    command: >
+      torchrun --nproc_per_node=1 run_demo_image_to_video.py
+      --checkpoint_dir=/app/weights/LongCat-Video
+      --enable_compile
+
+  # ---- Video Continuation ----
+  vc:
+    <<: *base
+    command: >
+      torchrun --nproc_per_node=1 run_demo_video_continuation.py
+      --checkpoint_dir=/app/weights/LongCat-Video
+      --enable_compile
+
+  # ---- Long Video Generation ----
+  long-video:
+    <<: *base
+    command: >
+      torchrun --nproc_per_node=1 run_demo_long_video.py
+      --checkpoint_dir=/app/weights/LongCat-Video
+      --enable_compile
+
+  # ---- Interactive Video Generation ----
+  interactive:
+    <<: *base
+    command: >
+      torchrun --nproc_per_node=1 run_demo_interactive_video.py
+      --checkpoint_dir=/app/weights/LongCat-Video
+      --enable_compile
+
+  # ---- Avatar Single Audio (v1.5, distill, INT8, 4 GPU) ----
+  avatar-single:
+    <<: *base
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - RANK=0
+      - LOCAL_RANK=0
+      - WORLD_SIZE=4
+      - MASTER_ADDR=127.0.0.1
+      - MASTER_PORT=29500
+    command: >
+      torchrun --nproc_per_node=4 run_demo_avatar_single_audio_to_video_timed.py
+      --context_parallel_size=4
+      --checkpoint_dir=/app/weights/LongCat-Video-Avatar-1.5
+      --stage_1=ai2v
+      --input_json=/app/assets/avatar/single_example_1.json
+      --use_distill
+      --model_type=avatar-v1.5
+      --use_int8
+
+  # ---- Avatar Single Audio (v1.0, 2 GPU) ----
+  avatar-single-v1:
+    <<: *base
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - RANK=0
+      - LOCAL_RANK=0
+      - WORLD_SIZE=2
+      - MASTER_ADDR=127.0.0.1
+      - MASTER_PORT=29500
+    command: >
+      torchrun --nproc_per_node=2 run_demo_avatar_single_audio_to_video_timed.py
+      --context_parallel_size=2
+      --checkpoint_dir=/app/weights/LongCat-Video-Avatar
+      --stage_1=ai2v
+      --input_json=/app/assets/avatar/single_example_1.json
+      --model_type=avatar-v1.0
+
+  # ---- Avatar Multi Audio (v1.5, distill, INT8, 2 GPU) ----
+  avatar-multi:
+    <<: *base
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - RANK=0
+      - LOCAL_RANK=0
+      - WORLD_SIZE=2
+      - MASTER_ADDR=127.0.0.1
+      - MASTER_PORT=29500
+    command: >
+      torchrun --nproc_per_node=2 run_demo_avatar_multi_audio_to_video_timed.py
+      --context_parallel_size=2
+      --checkpoint_dir=/app/weights/LongCat-Video-Avatar-1.5
+      --input_json=/app/assets/avatar/multi_example_1.json
+      --use_distill
+      --model_type=avatar-v1.5
+      --use_int8
+
+  # ---- Streamlit Web UI ----
+  streamlit:
+    <<: *base
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    command: >
+      streamlit run ./run_streamlit.py
+      --server.fileWatcherType none
+      --server.headless=true
+      --server.address=0.0.0.0
+      --server.port=8501
