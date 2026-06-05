@@ -245,6 +245,13 @@ def generate(args):
     pipe.to(local_rank)
     timer.stop()
 
+    # === 开启 VAE 的极致显存优化，专治去噪后的 OOM ===
+    if hasattr(pipe.vae, 'enable_slicing'):
+        pipe.vae.enable_slicing()
+    if hasattr(pipe.vae, 'enable_tiling'):
+        pipe.vae.enable_tiling()
+    # =======================================================
+
     global_seed = 42
     seed = global_seed + global_rank
 
@@ -391,6 +398,10 @@ def generate(args):
     ref_latent = latent[:, :, :1].clone()
     all_generated_frames = video
 
+    # === 在进入第二段生成前，释放所有不需要的显存 ===
+    torch.cuda.empty_cache()
+    # ====================================================
+
     for segment_idx in range(1, num_segments):
         if local_rank == 0:
             timer.log(f"正在生成片段 {segment_idx+1}/{num_segments}...")
@@ -418,7 +429,7 @@ def generate(args):
             generator=generator,
             output_type='both',
             use_kv_cache=True,
-            offload_kv_cache=False,
+            offload_kv_cache=True,
             enhance_hf=True if not use_distill else False,
             audio_emb=audio_emb,
             ref_latent=ref_latent,
