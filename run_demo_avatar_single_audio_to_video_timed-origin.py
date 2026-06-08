@@ -204,29 +204,36 @@ def generate(args):
         raise ValueError(f"Unsupported model_type: {model_type}. Expected 'avatar-v1.0' or 'avatar-v1.5'.")
     timer.stop()
     
-    # initialize audio models
+    # initialize audio models (只在主进程加载，避免多卡 ONNX 线程爆炸与重复显存占用)
     timer.start("[模型] 音频编码器 & 特征提取器")
-    if model_type == "avatar-v1.0":
-        audio_model_checkpoint_path = os.path.join(checkpoint_dir, 'chinese-wav2vec2-base')
-    elif model_type == "avatar-v1.5":
-        audio_model_checkpoint_path = os.path.join(checkpoint_dir, 'whisper-large-v3')
-    audio_encoder = get_audio_encoder(audio_model_checkpoint_path, model_type).to(local_rank)
-    audio_feature_extractor = get_audio_feature_extractor(audio_model_checkpoint_path, model_type)
+    audio_encoder = None
+    audio_feature_extractor = None
+
+    if cp_rank == 0:
+        if model_type == "avatar-v1.0":
+            audio_model_checkpoint_path = os.path.join(checkpoint_dir, 'chinese-wav2vec2-base')
+        elif model_type == "avatar-v1.5":
+            audio_model_checkpoint_path = os.path.join(checkpoint_dir, 'whisper-large-v3')
+        audio_encoder = get_audio_encoder(audio_model_checkpoint_path, model_type).to(local_rank)
+        audio_feature_extractor = get_audio_feature_extractor(audio_model_checkpoint_path, model_type)
     timer.stop()
 
     timer.start("[模型] 人声分离器")
-    vocal_separator_path = os.path.join(checkpoint_dir, 'vocal_separator/Kim_Vocal_2.onnx')
-    audio_output_dir_temp = f"./audio_temp_file"
-    os.makedirs(audio_output_dir_temp, exist_ok=True)
-    audio_output_dir_temp = Path(audio_output_dir_temp)
-    audio_separator_model_path = os.path.dirname(vocal_separator_path)
-    audio_separator_model_name = os.path.basename(vocal_separator_path)
-    vocal_separator = Separator(
-        output_dir=audio_output_dir_temp / "vocals",
-        output_single_stem="vocals",
-        model_file_dir=audio_separator_model_path,
-    )
-    vocal_separator.load_model(audio_separator_model_name)
+    vocal_separator = None
+    audio_output_dir_temp = Path(f"./audio_temp_file")
+
+    if cp_rank == 0:
+        vocal_separator_path = os.path.join(checkpoint_dir, 'vocal_separator/Kim_Vocal_2.onnx')
+        os.makedirs(audio_output_dir_temp, exist_ok=True)
+
+        audio_separator_model_path = os.path.dirname(vocal_separator_path)
+        audio_separator_model_name = os.path.basename(vocal_separator_path)
+        vocal_separator = Separator(
+            output_dir=audio_output_dir_temp / "vocals",
+            output_single_stem="vocals",
+            model_file_dir=audio_separator_model_path,
+        )
+        vocal_separator.load_model(audio_separator_model_name)
     timer.stop()
 
     
@@ -290,6 +297,16 @@ def generate(args):
         
         if os.path.exists(temp_vocal_path):
             os.remove(temp_vocal_path)
+
+        # === 音频特征广播完毕，彻底释放主卡上的音频大模型，抹平显存水位差 ===
+        del audio_encoder
+        del audio_feature_extractor
+        del vocal_separator
+        # 必须同时清除 pipeline 内部的引用，否则 GC 无法回收显存
+        pipe.audio_encoder = None
+        pipe.audio_feature_extractor = None
+        torch_gc()
+        # ========================================================================
 
     elif context_parallel_util.get_cp_size() > 1:
         timer.start("[音频] CP接收音频嵌入")

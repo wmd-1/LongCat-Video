@@ -156,14 +156,13 @@ def save_quantized_state_dict(model: nn.Module, save_dir: str, config_source_dir
 
 
 def load_quantized_dit(checkpoint_dir: str, subfolder: str = "base_model_int8", **kwargs):
-    """Load a quantized DiT model.
+    """Load a quantized DiT model directly into target GPU with optimized CPU memory profile.
 
     Uses ``accelerate.init_empty_weights`` to create the model with meta tensors
-    (zero memory), then loads weights shard-by-shard with ``assign=True`` so that
-    only *one* shard needs to be resident in CPU memory at a time.
-
-    Compared to the naive approach this cuts peak CPU memory from roughly
-    2x model-size down to model-size + one-shard (~4 GB).
+    (zero memory), then loads weights shard-by-shard directly into the target GPU
+    with ``assign=True`` so that CPU RAM only needs to buffer a single shard (~4GB)
+    at a time. This eliminates the CPU RAM spike that occurs when multiple
+    ``torchrun`` processes each instantiate the full model on CPU simultaneously.
 
     Args:
         checkpoint_dir: Base checkpoint directory.
@@ -171,7 +170,7 @@ def load_quantized_dit(checkpoint_dir: str, subfolder: str = "base_model_int8", 
         **kwargs: Additional kwargs passed to the model constructor (e.g., cp_split_hw).
 
     Returns:
-        The quantized DiT model ready for inference.
+        The quantized DiT model ready for inference on the target GPU.
     """
     import gc
     from accelerate import init_empty_weights
@@ -193,11 +192,19 @@ def load_quantized_dit(checkpoint_dir: str, subfolder: str = "base_model_int8", 
     # Override with kwargs
     config.update(kwargs)
 
+    # ---- Determine target device from LOCAL_RANK ----
+    # Each torchrun process loads directly into its assigned GPU, avoiding
+    # the CPU RAM spike that occurs when N processes each materialize the
+    # full model on CPU before pipe.to(local_rank).
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    target_device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+
+    # Defensive: explicitly bind device context to prevent implicit default
+    # CUDA context creation in multi-GPU distributed setups.
+    if "cuda" in target_device:
+        torch.cuda.set_device(local_rank)
+
     # ---- Optimisation 1: create model with meta tensors (0 memory) ----
-    # init_empty_weights patches register_parameter / register_buffer so that
-    # every tensor is allocated on the meta device instead of real CPU RAM.
-    # This avoids allocating ~28 GB of random weights that are immediately
-    # discarded when the state dict is loaded.
     with init_empty_weights():
         model = LongCatVideoAvatarTransformer3DModel(**config)
 
@@ -219,10 +226,9 @@ def load_quantized_dit(checkpoint_dir: str, subfolder: str = "base_model_int8", 
             setattr(parent, parts[-1], ql)
 
     # ---- Optimisation 2: load shards one at a time with assign=True ----
-    # Instead of accumulating all shards into one big state_dict (which
-    # doubles peak memory), we load each shard, apply it to the model via
-    # load_state_dict(assign=True) which directly replaces the meta tensors
-    # with real ones, and then free the shard immediately.
+    # Shards are loaded directly into target GPU memory. assign=True replaces
+    # the meta tensors in-place, so no extra GPU-to-GPU copy occurs. CPU RAM
+    # only needs to buffer a single shard (~4GB) at a time during disk I/O.
     index_path = os.path.join(quantized_dir, "quantized_model.safetensors.index.json")
     loaded_keys = set()
 
@@ -233,7 +239,7 @@ def load_quantized_dit(checkpoint_dir: str, subfolder: str = "base_model_int8", 
         shard_files = set(index["weight_map"].values())
         for shard_file in sorted(shard_files):
             shard_path = os.path.join(quantized_dir, shard_file)
-            shard_dict = load_file(shard_path, device="cpu")
+            shard_dict = load_file(shard_path, device=target_device)
             model.load_state_dict(shard_dict, strict=False, assign=True)
             loaded_keys.update(shard_dict.keys())
             del shard_dict
@@ -242,7 +248,7 @@ def load_quantized_dit(checkpoint_dir: str, subfolder: str = "base_model_int8", 
         files = [f for f in os.listdir(quantized_dir) if f.endswith(".safetensors") and "index" not in f]
         all_expected_keys = None
         for f in sorted(files):
-            shard_dict = load_file(os.path.join(quantized_dir, f), device="cpu")
+            shard_dict = load_file(os.path.join(quantized_dir, f), device=target_device)
             model.load_state_dict(shard_dict, strict=False, assign=True)
             loaded_keys.update(shard_dict.keys())
             del shard_dict
@@ -257,7 +263,9 @@ def load_quantized_dit(checkpoint_dir: str, subfolder: str = "base_model_int8", 
     model.eval()
 
     # Cast non-quantized parameters (Conv3d, LayerNorm, etc.) to bfloat16
-    # QuantizedLinear buffers (int8, float32 scale) are kept as-is
+    # Non-quantized parameters are already on GPU; conversion happens in-place.
+    # QuantizedLinear buffers (int8 weights, float32 scale) are kept as-is
+    # for precision — scale is dynamically cast in forward().
     for name, module in model.named_modules():
         if isinstance(module, QuantizedLinear):
             continue
