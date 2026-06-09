@@ -18,6 +18,8 @@ RUN find /usr/local/bin -type f -executable -print0 \
     | xargs -0 sed -i '1s|^#!.*python.*$|#!/usr/bin/python3|'
 
 # 3. 补充缺失的间接依赖
+RUN apt-get update && apt-get install -y --no-install-recommends python3.10-dev \
+    && rm -rf /var/lib/apt/lists/*
 RUN pip install accelerate
 
 # 4. 修复 ENTRYPOINT：改为 CMD，避免 bash 误解释所有命令
