@@ -365,13 +365,13 @@ class LongCatVideoPipeline:
         target_h, target_w = bucket_config[closest_bucket][0]
         return target_h, target_w
     
-    def optimized_scale(self, positive_flat, negative_flat):
+    def optimized_scale(self, positive, negative):
         """ from CFG-zero paper
         """
-        # Calculate dot production
-        dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
-        # Squared norm of uncondition
-        squared_norm = torch.sum(negative_flat ** 2, dim=1, keepdim=True) + 1e-8
+        # Sum over all dims except batch (dim=0), avoiding reshape/contiguous on large tensors
+        reduce_dims = tuple(range(1, positive.ndim))
+        dot_product = (positive * negative).sum(dim=reduce_dims, keepdim=True)
+        squared_norm = (negative ** 2).sum(dim=reduce_dims, keepdim=True) + 1e-8
         # st_star = v_condˆT * v_uncond / ||v_uncond||ˆ2
         st_star = dot_product / squared_norm
         return st_star
@@ -523,10 +523,6 @@ class LongCatVideoPipeline:
                 context_parallel_util.cp_broadcast(negative_prompt_embeds)
                 context_parallel_util.cp_broadcast(negative_prompt_attention_mask)
         
-        if self.do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
-
         # 4. Prepare timesteps
         sigmas = self.get_timesteps_sigmas(num_inference_steps, use_distill=use_distill)
         self.scheduler.set_timesteps(num_inference_steps, sigmas=sigmas, device=device)
@@ -549,7 +545,7 @@ class LongCatVideoPipeline:
         if context_parallel_util.get_cp_size() > 1:
             context_parallel_util.cp_broadcast(latents)
 
-        # 6. Denoising loop
+        # 6. Denoising loop (serial CFG: run uncond/cond separately to halve peak activation memory)
         if context_parallel_util.get_cp_size() > 1:
             torch.distributed.barrier(group=context_parallel_util.get_cp_group())
 
@@ -560,31 +556,32 @@ class LongCatVideoPipeline:
 
                 self._current_timestep = t
 
-                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-                latent_model_input = latent_model_input.to(dit_dtype)
-
-                timestep = t.expand(latent_model_input.shape[0]).to(dit_dtype)
-
-                noise_pred = self.dit(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    encoder_attention_mask=prompt_attention_mask,
-                )
+                latent_model_input = latents.to(dit_dtype)
+                ts = t.expand(latent_model_input.shape[0]).to(dit_dtype)
 
                 if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
-
-                    B = noise_pred_cond.shape[0]
-                    positive = noise_pred_cond.reshape(B, -1)
-                    negative = noise_pred_uncond.reshape(B, -1)
-                    # Calculate the optimized scale
-                    st_star = self.optimized_scale(positive, negative)
-                    # Reshape for broadcasting
-                    st_star = st_star.view(B, 1, 1, 1)
-                    # print(f'step i: {i} --> scale: {st_star}')
-
-                    noise_pred = noise_pred_uncond * st_star + guidance_scale * (noise_pred_cond - noise_pred_uncond * st_star) 
+                    noise_pred_uncond = self.dit(
+                        hidden_states=latent_model_input,
+                        timestep=ts,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        encoder_attention_mask=negative_prompt_attention_mask,
+                    )
+                    noise_pred_cond = self.dit(
+                        hidden_states=latent_model_input,
+                        timestep=ts,
+                        encoder_hidden_states=prompt_embeds,
+                        encoder_attention_mask=prompt_attention_mask,
+                    )
+                    st_star = self.optimized_scale(noise_pred_cond, noise_pred_uncond)
+                    noise_pred = noise_pred_uncond * st_star + guidance_scale * (noise_pred_cond - noise_pred_uncond * st_star)
+                    del noise_pred_uncond, noise_pred_cond, st_star
+                else:
+                    noise_pred = self.dit(
+                        hidden_states=latent_model_input,
+                        timestep=ts,
+                        encoder_hidden_states=prompt_embeds,
+                        encoder_attention_mask=prompt_attention_mask,
+                    )
 
                 # negate for scheduler compatibility
                 noise_pred = -noise_pred
@@ -686,9 +683,6 @@ class LongCatVideoPipeline:
             num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
         num_frames = max(num_frames, 1)
 
-        has_neg_prompt = negative_prompt is not None 
-        do_true_cfg = guidance_scale > 1 and has_neg_prompt
-
         self._guidance_scale = guidance_scale
         self._attention_kwargs = attention_kwargs
         self._current_timestep = None
@@ -739,10 +733,6 @@ class LongCatVideoPipeline:
                 context_parallel_util.cp_broadcast(negative_prompt_embeds)
                 context_parallel_util.cp_broadcast(negative_prompt_attention_mask)
 
-        if self.do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
-        
         # 4. Prepare timesteps
         sigmas = self.get_timesteps_sigmas(num_inference_steps, use_distill=use_distill)
         self.scheduler.set_timesteps(num_inference_steps, sigmas=sigmas, device=device)
@@ -770,7 +760,7 @@ class LongCatVideoPipeline:
         if context_parallel_util.get_cp_size() > 1:
             context_parallel_util.cp_broadcast(latents)
 
-        # 6. Denoising loop
+        # 6. Denoising loop (serial CFG: run uncond/cond separately to halve peak activation memory)
         if context_parallel_util.get_cp_size() > 1:
             torch.distributed.barrier(group=context_parallel_util.get_cp_group())
 
@@ -781,34 +771,37 @@ class LongCatVideoPipeline:
 
                 self._current_timestep = t
 
-                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-                latent_model_input = latent_model_input.to(dit_dtype)
-
-                timestep = t.expand(latent_model_input.shape[0]).to(dit_dtype)
-                timestep = timestep.unsqueeze(-1).repeat(1, latent_model_input.shape[2])
-                timestep[:, :1] = 0
-
-                noise_pred = self.dit(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    encoder_attention_mask=prompt_attention_mask,
-                    num_cond_latents=1,
-                )
+                latent_model_input = latents.to(dit_dtype)
+                ts = t.expand(latent_model_input.shape[0]).to(dit_dtype)
+                ts = ts.unsqueeze(-1).repeat(1, latent_model_input.shape[2])
+                ts[:, :1] = 0
 
                 if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
-                    
-                    B = noise_pred_cond.shape[0]
-                    positive = noise_pred_cond.reshape(B, -1)
-                    negative = noise_pred_uncond.reshape(B, -1)
-                    # Calculate the optimized scale
-                    st_star = self.optimized_scale(positive, negative)
-                    # Reshape for broadcasting
-                    st_star = st_star.view(B, 1, 1, 1)
-                    # print(f'step i: {i} --> scale: {st_star}')
-
+                    noise_pred_uncond = self.dit(
+                        hidden_states=latent_model_input,
+                        timestep=ts,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        encoder_attention_mask=negative_prompt_attention_mask,
+                        num_cond_latents=1,
+                    )
+                    noise_pred_cond = self.dit(
+                        hidden_states=latent_model_input,
+                        timestep=ts,
+                        encoder_hidden_states=prompt_embeds,
+                        encoder_attention_mask=prompt_attention_mask,
+                        num_cond_latents=1,
+                    )
+                    st_star = self.optimized_scale(noise_pred_cond, noise_pred_uncond)
                     noise_pred = noise_pred_uncond * st_star + guidance_scale * (noise_pred_cond - noise_pred_uncond * st_star)
+                    del noise_pred_uncond, noise_pred_cond, st_star
+                else:
+                    noise_pred = self.dit(
+                        hidden_states=latent_model_input,
+                        timestep=ts,
+                        encoder_hidden_states=prompt_embeds,
+                        encoder_attention_mask=prompt_attention_mask,
+                        num_cond_latents=1,
+                    )
 
                 # negate for scheduler compatibility
                 noise_pred = -noise_pred
@@ -972,10 +965,6 @@ class LongCatVideoPipeline:
                 context_parallel_util.cp_broadcast(negative_prompt_embeds)
                 context_parallel_util.cp_broadcast(negative_prompt_attention_mask)
 
-        if self.do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
-
         # 4. Prepare timesteps
         sigmas = self.get_timesteps_sigmas(num_inference_steps, use_distill=use_distill)
         self.scheduler.set_timesteps(num_inference_steps, sigmas=sigmas, device=device)
@@ -1015,7 +1004,7 @@ class LongCatVideoPipeline:
 
         num_cond_latents = 1 + (num_cond_frames - 1) // self.vae_scale_factor_temporal
         
-        # 6. Denoising loop
+        # 6. Denoising loop (serial CFG: run uncond/cond separately to halve peak activation memory)
         if context_parallel_util.get_cp_size() > 1:
             torch.distributed.barrier(group=context_parallel_util.get_cp_group())
 
@@ -1034,36 +1023,41 @@ class LongCatVideoPipeline:
 
                 self._current_timestep = t
 
-                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-                latent_model_input = latent_model_input.to(dit_dtype)
-
-                timestep = t.expand(latent_model_input.shape[0]).to(dit_dtype)
-                timestep = timestep.unsqueeze(-1).repeat(1, latent_model_input.shape[2])
+                latent_model_input = latents.to(dit_dtype)
+                ts = t.expand(latent_model_input.shape[0]).to(dit_dtype)
+                ts = ts.unsqueeze(-1).repeat(1, latent_model_input.shape[2])
                 if not use_kv_cache:
-                    timestep[:, :num_cond_latents] = 0
-
-                noise_pred = self.dit(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    encoder_attention_mask=prompt_attention_mask,
-                    num_cond_latents=num_cond_latents,
-                    kv_cache_dict=kv_cache_dict
-                )
+                    ts[:, :num_cond_latents] = 0
 
                 if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
-                    
-                    B = noise_pred_cond.shape[0]
-                    positive = noise_pred_cond.reshape(B, -1)
-                    negative = noise_pred_uncond.reshape(B, -1)
-                    # Calculate the optimized scale
-                    st_star = self.optimized_scale(positive, negative)
-                    # Reshape for broadcasting
-                    st_star = st_star.view(B, 1, 1, 1)
-                    # print(f'step i: {i} --> scale: {st_star}')
-
+                    noise_pred_uncond = self.dit(
+                        hidden_states=latent_model_input,
+                        timestep=ts,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        encoder_attention_mask=negative_prompt_attention_mask,
+                        num_cond_latents=num_cond_latents,
+                        kv_cache_dict=kv_cache_dict,
+                    )
+                    noise_pred_cond = self.dit(
+                        hidden_states=latent_model_input,
+                        timestep=ts,
+                        encoder_hidden_states=prompt_embeds,
+                        encoder_attention_mask=prompt_attention_mask,
+                        num_cond_latents=num_cond_latents,
+                        kv_cache_dict=kv_cache_dict,
+                    )
+                    st_star = self.optimized_scale(noise_pred_cond, noise_pred_uncond)
                     noise_pred = noise_pred_uncond * st_star + guidance_scale * (noise_pred_cond - noise_pred_uncond * st_star)
+                    del noise_pred_uncond, noise_pred_cond, st_star
+                else:
+                    noise_pred = self.dit(
+                        hidden_states=latent_model_input,
+                        timestep=ts,
+                        encoder_hidden_states=prompt_embeds,
+                        encoder_attention_mask=prompt_attention_mask,
+                        num_cond_latents=num_cond_latents,
+                        kv_cache_dict=kv_cache_dict,
+                    )
                 
                 # negate for scheduler compatibility
                 noise_pred = -noise_pred

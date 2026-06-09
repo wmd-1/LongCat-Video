@@ -56,6 +56,7 @@ services:
       - WORLD_SIZE=1
       - MASTER_ADDR=127.0.0.1
       - MASTER_PORT=29500
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     shm_size: "16g"
     mem_limit: 256g
     deploy:
@@ -110,6 +111,7 @@ services:
       torchrun --nproc_per_node=1 run_demo_image_to_video.py
       --checkpoint_dir=/app/weights/LongCat-Video
       --enable_compile
+      --spatial_refine_only
 
   # ---- Video Continuation ----
   vc:
