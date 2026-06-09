@@ -139,6 +139,11 @@ def generate(args):
     )
     pipe.to(local_rank)
 
+    # 将 T5 文本编码器卸载至 CPU，释放约 10GB/卡 显存（pipeline 内部按需加载/卸载）
+    pipe.text_encoder.to("cpu")
+    torch_gc()
+    timer.log("T5 Text Encoder 已卸载至 CPU，释放约 10GB 显存/卡")
+
     # 强制开启 VAE 分块解码 (Tiling) 以降低解码显存峰值
     if hasattr(pipe.vae, 'enable_tiling'):
         pipe.vae.enable_tiling()

@@ -154,6 +154,9 @@ class LongCatVideoPipeline:
                 torch dtype
         """
 
+        # 将 T5 文本编码器按需加载到 GPU（可能因显存优化被卸载至 CPU）
+        self.text_encoder.to(device)
+
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
 
@@ -185,7 +188,12 @@ class LongCatVideoPipeline:
         else:
             negative_prompt_embeds = None
             negative_prompt_attention_mask = None
-            
+
+        # 编码完毕，立即将 T5 卸载回 CPU 以释放显存
+        self.text_encoder.to("cpu")
+        gc.collect()
+        torch_gc()
+
         return prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask
 
     def check_inputs(
