@@ -599,6 +599,8 @@ class LongCatVideoPipeline:
             latents = latents.to(self.vae.dtype)
             latents = self.denormalize_latents(latents)
             output_video = self.vae.decode(latents, return_dict=False)[0]
+            del latents
+            torch_gc()
             output_video = self.video_processor.postprocess_video(output_video, output_type=output_type)
         else:
             output_video = latents
@@ -819,6 +821,8 @@ class LongCatVideoPipeline:
             latents = latents.to(self.vae.dtype)
             latents = self.denormalize_latents(latents)
             output_video = self.vae.decode(latents, return_dict=False)[0]
+            del latents
+            torch_gc()
             output_video = self.video_processor.postprocess_video(output_video, output_type=output_type)
         else:
             output_video = latents
@@ -1081,6 +1085,8 @@ class LongCatVideoPipeline:
             latents = latents.to(self.vae.dtype)
             latents = self.denormalize_latents(latents)
             output_video = self.vae.decode(latents, return_dict=False)[0]
+            del latents
+            torch_gc()
             output_video = self.video_processor.postprocess_video(output_video, output_type=output_type)
         else:
             output_video = latents
@@ -1323,6 +1329,8 @@ class LongCatVideoPipeline:
             latents = latents.to(self.vae.dtype)
             latents = self.denormalize_latents(latents)
             output_video = self.vae.decode(latents, return_dict=False)[0]
+            del latents
+            torch_gc()
             output_video = self.video_processor.postprocess_video(output_video, output_type=output_type)
             output_video = output_video[:, num_cond_frames_added: new_frame_size+num_cond_frames_added]
         else:

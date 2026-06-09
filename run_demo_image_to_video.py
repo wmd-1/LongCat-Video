@@ -1,5 +1,6 @@
 import os
 import time
+import gc
 import argparse
 import datetime
 import PIL.Image
@@ -137,6 +138,12 @@ def generate(args):
         dit = dit,
     )
     pipe.to(local_rank)
+
+    # 强制开启 VAE 分块解码 (Tiling) 以降低解码显存峰值
+    if hasattr(pipe.vae, 'enable_tiling'):
+        pipe.vae.enable_tiling()
+        timer.log("已启用 VAE 分块解码 (Tiling) 以降低解码显存峰值")
+
     timer.stop()
 
     global_seed = args.seed
@@ -171,6 +178,7 @@ def generate(args):
         write_video(os.path.join(output_dir, f"output_i2v_{timestamp}.mp4"), output_tensor, fps=15, video_codec="libx264", options={"crf": f"{18}"})
         timer.stop()
     del output
+    gc.collect()
     torch_gc()
 
     ### i2v distill (480p)
@@ -224,7 +232,8 @@ def generate(args):
     
     stage1_video = [(output_distill[i] * 255).astype(np.uint8) for i in range(output_distill.shape[0])]
     stage1_video = [PIL.Image.fromarray(img) for img in stage1_video]
-    del output_distill 
+    del output_distill
+    gc.collect()
     torch_gc()
 
     timer.start("[生成] 第三阶段: i2v refinement")
