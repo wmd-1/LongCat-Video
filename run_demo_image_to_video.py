@@ -76,6 +76,10 @@ def torch_gc():
 
 
 def generate(args):
+    # 参数校验
+    if args.checkpoint_dir is None:
+        raise ValueError("--checkpoint_dir 是必填参数，请指定模型权重目录")
+
     total_start = time.time()
     timer = StageTimer()
 
@@ -96,6 +100,7 @@ def generate(args):
     checkpoint_dir = args.checkpoint_dir
     context_parallel_size = args.context_parallel_size
     enable_compile = args.enable_compile
+    pipeline_mode = args.pipeline_mode
 
     # prepare distributed environment
     timer.start("[初始化] 分布式环境")
@@ -158,114 +163,249 @@ def generate(args):
     generator.manual_seed(seed)
 
     target_size = image.size  # (width, height)
+    # libx264 要求宽高均为偶数，奇数尺寸向下取整
+    target_size = (target_size[0] - target_size[0] % 2, target_size[1] - target_size[1] % 2)
 
-    ### i2v (480p)
-    timer.start("[生成] 第一阶段: i2v")
-    output = pipe.generate_i2v(
-        image=image,
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        resolution=args.resolution,
-        num_frames=args.num_frames,
-        num_inference_steps=args.num_inference_steps,
-        guidance_scale=args.guidance_scale,
-        generator=generator
-    )[0]
-    timer.stop()
+    # ========================================================================
+    # 模式一：仅运行 STAGE 1 (生成 480P 预览)
+    # ========================================================================
+    if pipeline_mode == 'stage1_only':
+        if local_rank == 0:
+            timer.log("[策略] stage1_only 模式：仅运行 Stage 1 (480p)，启用并行 CFG 加速")
 
-    if local_rank == 0:
-        timer.start("[保存] 第一阶段: i2v视频")
-        output = [(output[i] * 255).astype(np.uint8) for i in range(output.shape[0])]
-        output = [PIL.Image.fromarray(img) for img in output]
-        output = [frame.resize(target_size, PIL.Image.BICUBIC) for frame in output]
-
-        output_tensor = torch.from_numpy(np.array(output))
-        write_video(os.path.join(output_dir, f"output_i2v_{timestamp}.mp4"), output_tensor, fps=15, video_codec="libx264", options={"crf": f"{18}"})
-        timer.stop()
-    del output
-    gc.collect()
-    torch_gc()
-
-    ### i2v distill (480p)
-    timer.start("[模型] 加载 distill LoRA")
-    cfg_step_lora_path = os.path.join(checkpoint_dir, 'lora/cfg_step_lora.safetensors')
-    pipe.dit.load_lora(cfg_step_lora_path, 'cfg_step_lora')
-    pipe.dit.enable_loras(['cfg_step_lora'])
-    timer.stop()
-
-    if enable_compile:
-        timer.start("[模型] distill 编译")
-        dit = torch.compile(dit)
+        timer.start("[生成] 第一阶段: i2v (480p)")
+        output = pipe.generate_i2v(
+            image=image,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            resolution=args.resolution,
+            num_frames=args.num_frames,
+            num_inference_steps=args.num_inference_steps,
+            guidance_scale=args.guidance_scale,
+            generator=generator,
+            use_parallel_cfg=True,
+        )[0]
         timer.stop()
 
-    timer.start("[生成] 第二阶段: i2v distill")
-    output_distill = pipe.generate_i2v(
-        image=image,
-        prompt=prompt,
-        resolution=args.resolution,
-        num_frames=args.num_frames,
-        num_inference_steps=args.distill_inference_steps,
-        use_distill=True,
-        guidance_scale=1.0,
-        generator=generator,
-    )[0]
-    timer.stop()
-    pipe.dit.disable_all_loras()
+        if local_rank == 0:
+            timer.start("[保存] 第一阶段: i2v视频 (480p)")
+            output = [(output[i] * 255).astype(np.uint8) for i in range(output.shape[0])]
+            output = [PIL.Image.fromarray(img) for img in output]
+            output = [frame.resize(target_size, PIL.Image.BICUBIC) for frame in output]
 
-    if local_rank == 0:
-        timer.start("[保存] 第二阶段: i2v distill视频")
-        output_processed = [(output_distill[i] * 255).astype(np.uint8) for i in range(output_distill.shape[0])]
-        output_processed = [PIL.Image.fromarray(img) for img in output_processed]
-        output_processed = [frame.resize(target_size, PIL.Image.BICUBIC) for frame in output_processed]
+            output_tensor = torch.from_numpy(np.array(output))
+            write_video(os.path.join(output_dir, f"output_stage1_480p_{timestamp}.mp4"), output_tensor, fps=15, video_codec="libx264", options={"crf": f"{18}"})
+            timer.stop()
 
-        output_processed_tensor = torch.from_numpy(np.array(output_processed))
-        write_video(os.path.join(output_dir, f"output_i2v_distill_{timestamp}.mp4"), output_processed_tensor, fps=15, video_codec="libx264", options={"crf": f"{18}"})
+        del output
+        gc.collect()
+        torch_gc()
+
+    # ========================================================================
+    # 模式二：仅运行 STAGE 2 + STAGE 3 (高效生成 720P)
+    # ========================================================================
+    elif pipeline_mode == 'refine_only':
+        if local_rank == 0:
+            timer.log("[策略] refine_only 模式：跳过 Stage 1，直接 Distill + Refine 生成 720P")
+
+        # Stage 2: Distill 快速生成 480P 骨架
+        timer.start("[模型] 加载 distill LoRA")
+        cfg_step_lora_path = os.path.join(checkpoint_dir, 'lora/cfg_step_lora.safetensors')
+        pipe.dit.load_lora(cfg_step_lora_path, 'cfg_step_lora')
+        pipe.dit.enable_loras(['cfg_step_lora'])
         timer.stop()
 
-    ### i2v refinement (720p)
-    timer.start("[模型] 加载 refinement LoRA & BSA")
-    refinement_lora_path = os.path.join(checkpoint_dir, 'lora/refinement_lora.safetensors')
-    pipe.dit.load_lora(refinement_lora_path, 'refinement_lora')
-    pipe.dit.enable_loras(['refinement_lora'])
-    pipe.dit.enable_bsa()
-    timer.stop()
+        if enable_compile:
+            timer.start("[模型] distill 编译")
+            dit = torch.compile(dit)
+            timer.stop()
 
-    if enable_compile:
-        timer.start("[模型] refine 编译")
-        dit = torch.compile(dit)
+        timer.start("[生成] 第二阶段: i2v distill (480p)")
+        output_distill = pipe.generate_i2v(
+            image=image,
+            prompt=prompt,
+            resolution=args.resolution,
+            num_frames=args.num_frames,
+            num_inference_steps=args.distill_inference_steps,
+            use_distill=True,
+            guidance_scale=1.0,
+            generator=generator,
+        )[0]
         timer.stop()
-    
-    stage1_video = [(output_distill[i] * 255).astype(np.uint8) for i in range(output_distill.shape[0])]
-    stage1_video = [PIL.Image.fromarray(img) for img in stage1_video]
-    del output_distill
-    gc.collect()
-    torch_gc()
+        pipe.dit.disable_all_loras()
 
-    timer.start("[生成] 第三阶段: i2v refinement")
-    output_refine = pipe.generate_refine(
-        image=image,
-        prompt=prompt,
-        stage1_video=stage1_video,
-        num_cond_frames=1,
-        num_inference_steps=args.refine_inference_steps,
-        generator=generator,
-        spatial_refine_only=spatial_refine_only
-    )[0]
-    timer.stop()
+        if local_rank == 0:
+            timer.start("[保存] 第二阶段: i2v distill视频 (480p)")
+            output_processed = [(output_distill[i] * 255).astype(np.uint8) for i in range(output_distill.shape[0])]
+            output_processed = [PIL.Image.fromarray(img) for img in output_processed]
+            output_processed = [frame.resize(target_size, PIL.Image.BICUBIC) for frame in output_processed]
 
-    pipe.dit.disable_all_loras()
-    pipe.dit.disable_bsa()
+            output_processed_tensor = torch.from_numpy(np.array(output_processed))
+            write_video(os.path.join(output_dir, f"output_stage2_distill_{timestamp}.mp4"), output_processed_tensor, fps=15, video_codec="libx264", options={"crf": f"{18}"})
+            timer.stop()
 
-    if local_rank == 0:
-        timer.start("[保存] 第三阶段: i2v refine视频")
-        output_refine = [(output_refine[i] * 255).astype(np.uint8) for i in range(output_refine.shape[0])]
-        output_refine = [PIL.Image.fromarray(img) for img in output_refine]
-        output_refine = [frame.resize(target_size, PIL.Image.BICUBIC) for frame in output_refine]
+        # Stage 3: Refine 超分至 720P
+        stage1_video = [(output_distill[i] * 255).astype(np.uint8) for i in range(output_distill.shape[0])]
+        stage1_video = [PIL.Image.fromarray(img) for img in stage1_video]
+        del output_distill
+        gc.collect()
+        torch_gc()
 
-        output_tensor = torch.from_numpy(np.array(output_refine))
-        fps = 15 if spatial_refine_only else 30
-        write_video(os.path.join(output_dir, f"output_i2v_refine_{timestamp}.mp4"), output_tensor, fps=fps, video_codec="libx264", options={"crf": f"{10}"})
+        timer.start("[模型] 加载 refinement LoRA & BSA")
+        refinement_lora_path = os.path.join(checkpoint_dir, 'lora/refinement_lora.safetensors')
+        pipe.dit.load_lora(refinement_lora_path, 'refinement_lora')
+        pipe.dit.enable_loras(['refinement_lora'])
+        pipe.dit.enable_bsa()
         timer.stop()
+
+        if enable_compile:
+            timer.start("[模型] refine 编译")
+            dit = torch.compile(dit)
+            timer.stop()
+
+        timer.start("[生成] 第三阶段: i2v refinement (720p)")
+        output_refine = pipe.generate_refine(
+            image=image,
+            prompt=prompt,
+            stage1_video=stage1_video,
+            num_cond_frames=1,
+            num_inference_steps=args.refine_inference_steps,
+            generator=generator,
+            spatial_refine_only=spatial_refine_only
+        )[0]
+        timer.stop()
+
+        pipe.dit.disable_all_loras()
+        pipe.dit.disable_bsa()
+
+        if local_rank == 0:
+            timer.start("[保存] 第三阶段: i2v refine视频 (720p)")
+            output_refine = [(output_refine[i] * 255).astype(np.uint8) for i in range(output_refine.shape[0])]
+            output_refine = [PIL.Image.fromarray(img) for img in output_refine]
+            output_refine = [frame.resize(target_size, PIL.Image.BICUBIC) for frame in output_refine]
+
+            output_tensor = torch.from_numpy(np.array(output_refine))
+            fps = 15 if spatial_refine_only else 30
+            write_video(os.path.join(output_dir, f"output_stage3_refine_720p_{timestamp}.mp4"), output_tensor, fps=fps, video_codec="libx264", options={"crf": f"{10}"})
+            timer.stop()
+
+        del output_refine
+        gc.collect()
+        torch_gc()
+
+    # ========================================================================
+    # 模式三：完整三阶段流水线 (默认，向后兼容)
+    # ========================================================================
+    else:  # pipeline_mode == 'full'
+        ### i2v (480p)
+        timer.start("[生成] 第一阶段: i2v")
+        output = pipe.generate_i2v(
+            image=image,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            resolution=args.resolution,
+            num_frames=args.num_frames,
+            num_inference_steps=args.num_inference_steps,
+            guidance_scale=args.guidance_scale,
+            generator=generator,
+            use_parallel_cfg=False,
+        )[0]
+        timer.stop()
+
+        if local_rank == 0:
+            timer.start("[保存] 第一阶段: i2v视频")
+            output = [(output[i] * 255).astype(np.uint8) for i in range(output.shape[0])]
+            output = [PIL.Image.fromarray(img) for img in output]
+            output = [frame.resize(target_size, PIL.Image.BICUBIC) for frame in output]
+
+            output_tensor = torch.from_numpy(np.array(output))
+            write_video(os.path.join(output_dir, f"output_i2v_{timestamp}.mp4"), output_tensor, fps=15, video_codec="libx264", options={"crf": f"{18}"})
+            timer.stop()
+
+        del output
+        gc.collect()
+        torch_gc()
+
+        ### i2v distill (480p)
+        timer.start("[模型] 加载 distill LoRA")
+        cfg_step_lora_path = os.path.join(checkpoint_dir, 'lora/cfg_step_lora.safetensors')
+        pipe.dit.load_lora(cfg_step_lora_path, 'cfg_step_lora')
+        pipe.dit.enable_loras(['cfg_step_lora'])
+        timer.stop()
+
+        if enable_compile:
+            timer.start("[模型] distill 编译")
+            dit = torch.compile(dit)
+            timer.stop()
+
+        timer.start("[生成] 第二阶段: i2v distill")
+        output_distill = pipe.generate_i2v(
+            image=image,
+            prompt=prompt,
+            resolution=args.resolution,
+            num_frames=args.num_frames,
+            num_inference_steps=args.distill_inference_steps,
+            use_distill=True,
+            guidance_scale=1.0,
+            generator=generator,
+        )[0]
+        timer.stop()
+        pipe.dit.disable_all_loras()
+
+        if local_rank == 0:
+            timer.start("[保存] 第二阶段: i2v distill视频")
+            output_processed = [(output_distill[i] * 255).astype(np.uint8) for i in range(output_distill.shape[0])]
+            output_processed = [PIL.Image.fromarray(img) for img in output_processed]
+            output_processed = [frame.resize(target_size, PIL.Image.BICUBIC) for frame in output_processed]
+
+            output_processed_tensor = torch.from_numpy(np.array(output_processed))
+            write_video(os.path.join(output_dir, f"output_i2v_distill_{timestamp}.mp4"), output_processed_tensor, fps=15, video_codec="libx264", options={"crf": f"{18}"})
+            timer.stop()
+
+        ### i2v refinement (720p)
+        timer.start("[模型] 加载 refinement LoRA & BSA")
+        refinement_lora_path = os.path.join(checkpoint_dir, 'lora/refinement_lora.safetensors')
+        pipe.dit.load_lora(refinement_lora_path, 'refinement_lora')
+        pipe.dit.enable_loras(['refinement_lora'])
+        pipe.dit.enable_bsa()
+        timer.stop()
+
+        if enable_compile:
+            timer.start("[模型] refine 编译")
+            dit = torch.compile(dit)
+            timer.stop()
+
+        stage1_video = [(output_distill[i] * 255).astype(np.uint8) for i in range(output_distill.shape[0])]
+        stage1_video = [PIL.Image.fromarray(img) for img in stage1_video]
+        del output_distill
+        gc.collect()
+        torch_gc()
+
+        timer.start("[生成] 第三阶段: i2v refinement")
+        output_refine = pipe.generate_refine(
+            image=image,
+            prompt=prompt,
+            stage1_video=stage1_video,
+            num_cond_frames=1,
+            num_inference_steps=args.refine_inference_steps,
+            generator=generator,
+            spatial_refine_only=spatial_refine_only
+        )[0]
+        timer.stop()
+
+        pipe.dit.disable_all_loras()
+        pipe.dit.disable_bsa()
+
+        if local_rank == 0:
+            timer.start("[保存] 第三阶段: i2v refine视频")
+            output_refine = [(output_refine[i] * 255).astype(np.uint8) for i in range(output_refine.shape[0])]
+            output_refine = [PIL.Image.fromarray(img) for img in output_refine]
+            output_refine = [frame.resize(target_size, PIL.Image.BICUBIC) for frame in output_refine]
+
+            output_tensor = torch.from_numpy(np.array(output_refine))
+            fps = 15 if spatial_refine_only else 30
+            write_video(os.path.join(output_dir, f"output_i2v_refine_{timestamp}.mp4"), output_tensor, fps=fps, video_codec="libx264", options={"crf": f"{10}"})
+            timer.stop()
 
     total_elapsed = time.time() - total_start
     if local_rank == 0:
@@ -354,6 +494,13 @@ def _parse_args():
         '--spatial_refine_only',
         action='store_true',
         help='Whether to only do spatial refinement (no temporal upsampling)',
+    )
+    parser.add_argument(
+        '--pipeline_mode',
+        type=str,
+        default='full',
+        choices=['full', 'stage1_only', 'refine_only'],
+        help="Pipeline mode: 'full' for all 3 stages, 'stage1_only' for quick 480p preview (Stage 1 only), 'refine_only' for distill + refine to 720p (Stage 2+3)",
     )
     parser.add_argument(
         '--seed',

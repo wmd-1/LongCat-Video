@@ -423,6 +423,7 @@ class LongCatVideoPipeline:
         output_type: Optional[str] = "np",
         attention_kwargs: Optional[Dict[str, Any]] = None,
         max_sequence_length: int = 512,
+        use_parallel_cfg: bool = False,
     ):
         r"""
         Generates video frames from text prompt using diffusion process.
@@ -553,7 +554,9 @@ class LongCatVideoPipeline:
         if context_parallel_util.get_cp_size() > 1:
             context_parallel_util.cp_broadcast(latents)
 
-        # 6. Denoising loop (serial CFG: run uncond/cond separately to halve peak activation memory)
+        # 6. Denoising loop
+        _use_parallel_cfg = use_parallel_cfg and self.do_classifier_free_guidance
+
         if context_parallel_util.get_cp_size() > 1:
             torch.distributed.barrier(group=context_parallel_util.get_cp_group())
 
@@ -568,18 +571,42 @@ class LongCatVideoPipeline:
                 ts = t.expand(latent_model_input.shape[0]).to(dit_dtype)
 
                 if self.do_classifier_free_guidance:
-                    noise_pred_uncond = self.dit(
-                        hidden_states=latent_model_input,
-                        timestep=ts,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        encoder_attention_mask=negative_prompt_attention_mask,
-                    )
-                    noise_pred_cond = self.dit(
-                        hidden_states=latent_model_input,
-                        timestep=ts,
-                        encoder_hidden_states=prompt_embeds,
-                        encoder_attention_mask=prompt_attention_mask,
-                    )
+                    # 尝试并行 CFG：拼接 uncond+cond 为 batch=2，单次 forward
+                    if _use_parallel_cfg:
+                        try:
+                            latent_parallel = torch.cat([latent_model_input, latent_model_input], dim=0)
+                            ts_parallel = torch.cat([ts, ts], dim=0)
+                            encoder_hidden_parallel = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+                            encoder_mask_parallel = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
+                            noise_pred_all = self.dit(
+                                hidden_states=latent_parallel,
+                                timestep=ts_parallel,
+                                encoder_hidden_states=encoder_hidden_parallel,
+                                encoder_attention_mask=encoder_mask_parallel,
+                            )
+                            noise_pred_uncond, noise_pred_cond = noise_pred_all.chunk(2, dim=0)
+                            del latent_parallel, ts_parallel, encoder_hidden_parallel, encoder_mask_parallel, noise_pred_all
+                        except torch.cuda.OutOfMemoryError:
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                            _use_parallel_cfg = False
+                            loguru.logger.warning(f"Step {i}: Parallel CFG OOM, falling back to serial CFG")
+
+                    # 串行 CFG（默认路径或 OOM 降级路径）
+                    if not _use_parallel_cfg:
+                        noise_pred_uncond = self.dit(
+                            hidden_states=latent_model_input,
+                            timestep=ts,
+                            encoder_hidden_states=negative_prompt_embeds,
+                            encoder_attention_mask=negative_prompt_attention_mask,
+                        )
+                        noise_pred_cond = self.dit(
+                            hidden_states=latent_model_input,
+                            timestep=ts,
+                            encoder_hidden_states=prompt_embeds,
+                            encoder_attention_mask=prompt_attention_mask,
+                        )
+
                     st_star = self.optimized_scale(noise_pred_cond, noise_pred_uncond)
                     noise_pred = noise_pred_uncond * st_star + guidance_scale * (noise_pred_cond - noise_pred_uncond * st_star)
                     del noise_pred_uncond, noise_pred_cond, st_star
@@ -633,6 +660,7 @@ class LongCatVideoPipeline:
         output_type: Optional[str] = "np",
         attention_kwargs: Optional[Dict[str, Any]] = None,
         max_sequence_length: int = 512,
+        use_parallel_cfg: bool = False,
     ):
         r"""
         Generates video frames from an input image and text prompt using diffusion process.
@@ -770,7 +798,9 @@ class LongCatVideoPipeline:
         if context_parallel_util.get_cp_size() > 1:
             context_parallel_util.cp_broadcast(latents)
 
-        # 6. Denoising loop (serial CFG: run uncond/cond separately to halve peak activation memory)
+        # 6. Denoising loop
+        _use_parallel_cfg = use_parallel_cfg and self.do_classifier_free_guidance
+
         if context_parallel_util.get_cp_size() > 1:
             torch.distributed.barrier(group=context_parallel_util.get_cp_group())
 
@@ -787,20 +817,45 @@ class LongCatVideoPipeline:
                 ts[:, :1] = 0
 
                 if self.do_classifier_free_guidance:
-                    noise_pred_uncond = self.dit(
-                        hidden_states=latent_model_input,
-                        timestep=ts,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        encoder_attention_mask=negative_prompt_attention_mask,
-                        num_cond_latents=1,
-                    )
-                    noise_pred_cond = self.dit(
-                        hidden_states=latent_model_input,
-                        timestep=ts,
-                        encoder_hidden_states=prompt_embeds,
-                        encoder_attention_mask=prompt_attention_mask,
-                        num_cond_latents=1,
-                    )
+                    # 尝试并行 CFG：拼接 uncond+cond 为 batch=2，单次 forward
+                    if _use_parallel_cfg:
+                        try:
+                            latent_parallel = torch.cat([latent_model_input, latent_model_input], dim=0)
+                            ts_parallel = torch.cat([ts, ts], dim=0)
+                            encoder_hidden_parallel = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+                            encoder_mask_parallel = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
+                            noise_pred_all = self.dit(
+                                hidden_states=latent_parallel,
+                                timestep=ts_parallel,
+                                encoder_hidden_states=encoder_hidden_parallel,
+                                encoder_attention_mask=encoder_mask_parallel,
+                                num_cond_latents=1,
+                            )
+                            noise_pred_uncond, noise_pred_cond = noise_pred_all.chunk(2, dim=0)
+                            del latent_parallel, ts_parallel, encoder_hidden_parallel, encoder_mask_parallel, noise_pred_all
+                        except torch.cuda.OutOfMemoryError:
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                            _use_parallel_cfg = False
+                            loguru.logger.warning(f"Step {i}: Parallel CFG OOM, falling back to serial CFG")
+
+                    # 串行 CFG（默认路径或 OOM 降级路径）
+                    if not _use_parallel_cfg:
+                        noise_pred_uncond = self.dit(
+                            hidden_states=latent_model_input,
+                            timestep=ts,
+                            encoder_hidden_states=negative_prompt_embeds,
+                            encoder_attention_mask=negative_prompt_attention_mask,
+                            num_cond_latents=1,
+                        )
+                        noise_pred_cond = self.dit(
+                            hidden_states=latent_model_input,
+                            timestep=ts,
+                            encoder_hidden_states=prompt_embeds,
+                            encoder_attention_mask=prompt_attention_mask,
+                            num_cond_latents=1,
+                        )
+
                     st_star = self.optimized_scale(noise_pred_cond, noise_pred_uncond)
                     noise_pred = noise_pred_uncond * st_star + guidance_scale * (noise_pred_cond - noise_pred_uncond * st_star)
                     del noise_pred_uncond, noise_pred_cond, st_star
